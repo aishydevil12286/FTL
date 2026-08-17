@@ -109,9 +109,9 @@ fi
 # They are gated behind CMake options so ordinary builds do not produce them.
 if [[ -n "${test}" ]]; then
     if [[ -n "${cmake_args}" ]]; then
-        cmake_args="${cmake_args} -DBUILD_TAR_REGRESSION=ON -DBUILD_GZIP_REGRESSION=ON"
+        cmake_args="${cmake_args} -DBUILD_TAR_REGRESSION=ON -DBUILD_GZIP_REGRESSION=ON -DBUILD_PTR_RESPONSE_REGRESSION=ON"
     else
-        cmake_args="-DBUILD_TAR_REGRESSION=ON -DBUILD_GZIP_REGRESSION=ON"
+        cmake_args="-DBUILD_TAR_REGRESSION=ON -DBUILD_GZIP_REGRESSION=ON -DBUILD_PTR_RESPONSE_REGRESSION=ON"
     fi
 fi
 
@@ -205,17 +205,20 @@ cmake --build . -- ${MAKEFLAGS}
 if [[ -n "${install}" ]]; then
     echo "Installing pihole-FTL"
     ${SUDO} cmake --install .
-else
-    echo "Copying compiled pihole-FTL binary to repository root"
-    cp pihole-FTL ../
-    # Copy the regression test binaries alongside it so the bats tests can run
-    # them from the repo root.
-    for regression_bin in tar_regression gzip_regression; do
-        if [[ -f "${regression_bin}" ]]; then
-            cp "${regression_bin}" ../
-        fi
-    done
 fi
+
+# Always copy the freshly built binary (and the regression test harnesses) to the
+# repository root, so test/run.sh runs exactly what we just built regardless of
+# whether we also install it system-wide.
+echo "Copying compiled pihole-FTL binary to repository root"
+cp pihole-FTL ../
+# Copy the regression test binaries alongside it so the bats tests can run them
+# from the repo root.
+for regression_bin in tar_regression gzip_regression ptr_response_regression; do
+    if [[ -f "${regression_bin}" ]]; then
+        cp "${regression_bin}" ../
+    fi
+done
 
 # If we are asked to run tests, we do this here
 if [[ -n "${test}" ]]; then
