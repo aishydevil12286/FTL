@@ -423,7 +423,8 @@ if(BUILD_PTR_RESPONSE_REGRESSION)
             ${PROJECT_SOURCE_DIR}/test/ptr_response_regression.c
             ${PROJECT_SOURCE_DIR}/src/resolve.c)
     target_include_directories(ptr_response_regression PRIVATE ${PROJECT_SOURCE_DIR}/src)
-    target_compile_options(ptr_response_regression PRIVATE -fvisibility=hidden)
+    target_compile_options(ptr_response_regression PRIVATE -fvisibility=hidden -ffunction-sections -fdata-sections)
+    target_link_options(ptr_response_regression PRIVATE -Wl,--gc-sections)
     target_link_libraries(ptr_response_regression Threads::Threads)
 
     # Optional ASan/UBSan instrumentation for local runs:
