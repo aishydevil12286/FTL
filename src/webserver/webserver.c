@@ -204,30 +204,39 @@ static int redirect_admin_handler(struct mg_connection *conn, void *input)
 	return 1;
 }
 
-static int begin_request_handler(struct mg_connection *conn)
+// Return true if the string contains a C0 control character or DEL.
+static bool contains_control_char(const char *s)
 {
-	// Reject any request whose (URL-decoded) path contains control
-	// characters. CivetWeb decodes local_uri_raw in place, so an encoded
-	// CR/LF (%0d%0a) arrives here as a literal newline. Several handlers
-	// reflect this path into response headers (e.g. the Location header
-	// built by redirect_lp_handler), where embedded CR/LF would allow HTTP
-	// response header injection / response splitting. Rejecting such requests
-	// centrally - before authentication and before any handler runs - closes
-	// the whole class of URI-into-header injection. This runs for every
-	// request before authentication, so the rejection is logged only at
-	// debug level and never echoes the URI: an unauthenticated client can
-	// trivially flood such requests, and logging each one at warning level
-	// (or logging the URI verbatim) would itself be a log-flooding /
-	// log-injection vector.
-	const struct mg_request_info *request = mg_get_request_info(conn);
-	for(const char *p = request->local_uri_raw; p != NULL && *p != '\0'; p++)
+	for(const char *p = s; p != NULL && *p != '\0'; p++)
 	{
 		if((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f)
-		{
-			log_debug(DEBUG_WEBSERVER, "Rejecting request with control character in URI");
-			mg_send_http_error(conn, 400, "Bad Request");
-			return 400;
-		}
+			return true;
+	}
+	return false;
+}
+
+static int begin_request_handler(struct mg_connection *conn)
+{
+	// Reject any request whose (URL-decoded) path or query string contains
+	// control characters. CivetWeb decodes local_uri_raw in place, so an
+	// encoded CR/LF (%0d%0a) arrives here as a literal newline. Several
+	// handlers reflect the path and/or query string into response headers
+	// (e.g. the Location header built by redirect_lp_handler), where
+	// embedded CR/LF would allow HTTP response header injection / response
+	// splitting. Rejecting such requests centrally - before authentication
+	// and before any handler runs - closes the whole class of URI-into-
+	// header injection. This runs for every request before authentication,
+	// so the rejection is logged only at debug level and never echoes the
+	// URI: an unauthenticated client can trivially flood such requests, and
+	// logging each one at warning level (or logging the URI verbatim) would
+	// itself be a log-flooding / log-injection vector.
+	const struct mg_request_info *request = mg_get_request_info(conn);
+	if(contains_control_char(request->local_uri_raw) ||
+	   contains_control_char(request->query_string))
+	{
+		log_debug(DEBUG_WEBSERVER, "Rejecting request with control character in URI or query string");
+		mg_send_http_error(conn, 400, "Bad Request");
+		return 400;
 	}
 
 	// Let CivetWeb process the request normally
@@ -643,6 +652,14 @@ void http_init(void)
 		return;
 	}
 
+	// Empty API password disables all web/API authentication. Warn loudly so
+	// operators notice before exposing the webserver beyond loopback.
+	if(config.webserver.api.pwhash.v.s[0] == '\0')
+	{
+		log_warn("webserver.api.password is empty — authentication is DISABLED for the web interface and API. Set a password before exposing ports %s beyond trusted networks.",
+		         config.webserver.port.v.s);
+	}
+
 	// Get maximum number of threads for webserver
 	char num_threads[16] = { 0 };
 	unsigned int threads = config.webserver.threads.v.ui;
@@ -840,16 +857,47 @@ void http_init(void)
 		strncpy(key, opt, key_len);
 		key[key_len] = '\0';
 
-		// Reject attempts to override the embedded web server's Lua
-		// options via advancedOpts. Pi-hole configures its own Lua
-		// handling internally, and options such as lua_background_script
-		// or lua_preload_file execute arbitrary code - allowing them here
-		// would turn this trusted-admin passthrough into a code execution
-		// vector (an authenticated user could point the web server at a
-		// script they control).
-		if(strncasecmp(key, "lua_", 4) == 0)
+		// Reject options that would undermine Pi-hole's own webserver
+		// security posture. advancedOpts is an authenticated admin
+		// passthrough into CivetWeb; without a deny-list it can be used
+		// to enable CGI interpreters, relocate the document root, decode
+		// query strings (re-opening header-injection classes), or
+		// override listening ports / TLS / ACL / Lua handling that
+		// Pi-hole configures itself. lua_* is matched by prefix because
+		// CivetWeb exposes several Lua knobs (lua_background_script,
+		// lua_preload_file, ...) that execute arbitrary code.
+		static const char *const denied_exact[] = {
+			"cgi_interpreter",
+			"cgi_environment",
+			"cgi_pattern",
+			"document_root",
+			"decode_query_string",
+			"websocket_root",
+			"access_control_list",
+			"listening_ports",
+			"ssl_certificate",
+			"error_pages",
+			"additional_header",
+			"enable_directory_listing",
+			"url_rewrite_patterns",
+			"put_delete_passwords_file",
+			"protect_uri",
+			"authentication_domain",
+			"global_auth_file",
+			"auth_uri",
+			"run_as_user",
+			"num_threads",
+			NULL
+		};
+		bool denied = strncasecmp(key, "lua_", 4) == 0;
+		for(size_t d = 0; !denied && denied_exact[d] != NULL; d++)
 		{
-			log_warn("Ignoring disallowed webserver.advancedOpts option \"%s\": lua_* options are not permitted", key);
+			if(strcasecmp(key, denied_exact[d]) == 0)
+				denied = true;
+		}
+		if(denied)
+		{
+			log_warn("Ignoring disallowed webserver.advancedOpts option \"%s\"", key);
 			free(key);
 			continue;
 		}

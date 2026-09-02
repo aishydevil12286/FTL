@@ -55,6 +55,20 @@ static inline void auto_unlock(pthread_mutex_t **mtx) {
 		(cond) ? (pthread_mutex_lock(m), (m)) : NULL
 #define AUTOUNLOCK() do { pthread_mutex_unlock(_alock); _alock = NULL; } while(0)
 
+// Cookie "; Secure" for an existing session: once established over TLS, keep
+// Secure for the session lifetime so a later plain-HTTP request cannot rewrite
+// the cookie without Secure and expose it on the wire.
+static inline const char *session_secure_attr(const bool tls_login)
+{
+	return tls_login ? "; Secure" : "";
+}
+
+// FTL_DELETE_COOKIE expects " Secure" (leading space, no semicolon)
+static inline const char *delete_cookie_secure_attr(const bool tls_login)
+{
+	return tls_login ? " Secure" : "";
+}
+
 static void add_request_info(struct ftl_conn *api, const char *csrf)
 {
 	// Copy CSRF token into request
@@ -185,24 +199,9 @@ int check_client_auth(struct ftl_conn *api, const bool is_api)
 		}
 	}
 
-	// If not, does the client provide a session ID via URI?
-	if(!sid_avail && api->request->query_string && GET_VAR("sid", sid, api->request->query_string) > 0)
-	{
-		// "+" may have been replaced by " ", undo this here
-		for(unsigned int i = 0; i < SID_SIZE; i++)
-			if(sid[i] == ' ')
-				sid[i] = '+';
-
-		// Zero terminate SID string
-		sid[SID_SIZE-1] = '\0';
-		// Mention source of SID
-		sid_source = "URI";
-		// Mark SID as available
-		sid_avail = true;
-	}
-
-	// An empty SID must never be treated as available: it could otherwise match
-	// a session slot whose sid was never populated (e.g. after an RNG failure).
+	// SID may be supplied via cookie, header, form-data, or JSON — never via
+	// the URI query string. Query-string SIDs leak into Referer headers,
+	// proxy/access logs, and browser history.
 	if(!sid_avail || sid[0] == '\0')
 	{
 		api->message = "no SID provided";
@@ -284,11 +283,11 @@ int check_client_auth(struct ftl_conn *api, const bool is_api)
 		// Set strict_tls permanently to false if the client connected via HTTP
 		auth_data[user_id].tls.mixed |= api->request->is_ssl != auth_data[user_id].tls.login;
 
-		// Update user cookie
+		// Update user cookie. Persist Secure if the session logged in over TLS.
 		if(snprintf(pi_hole_extra_headers, sizeof(pi_hole_extra_headers),
 		            FTL_SET_COOKIE,
 		            auth_data[user_id].sid, config.webserver.session.timeout.v.ui,
-		            api->request->is_ssl ? "; Secure" : "") < 0)
+		            session_secure_attr(auth_data[user_id].tls.login)) < 0)
 		{
 			return send_json_error(api, 500, "internal_error", "Internal server error", NULL);
 		}
@@ -435,7 +434,7 @@ static int send_api_auth_status(struct ftl_conn *api, const int user_id, const t
 		if(snprintf(pi_hole_extra_headers, sizeof(pi_hole_extra_headers),
 		            FTL_SET_COOKIE,
 		            auth_data[user_id].sid, config.webserver.session.timeout.v.ui,
-		            api->request->is_ssl ? "; Secure" : "") < 0)
+		            session_secure_attr(auth_data[user_id].tls.login)) < 0)
 		{
 			return send_json_error(api, 500, "internal_error", "Internal server error", NULL);
 		}
@@ -452,7 +451,7 @@ static int send_api_auth_status(struct ftl_conn *api, const int user_id, const t
 			log_debug(DEBUG_API, "API Auth status: Logout, asking to delete cookie");
 
 			snprintf(pi_hole_extra_headers, sizeof(pi_hole_extra_headers),
-			         FTL_DELETE_COOKIE, api->request->is_ssl ? " Secure" : "");
+			         FTL_DELETE_COOKIE, delete_cookie_secure_attr(auth_data[user_id].tls.login));
 
 			// Revoke client authentication. This slot can be used by a new client afterwards.
 			const int code = delete_session(user_id, false) ? 204 : 404;
@@ -483,7 +482,7 @@ static int send_api_auth_status(struct ftl_conn *api, const int user_id, const t
 		log_debug(DEBUG_API, "API Auth status: Invalid, asking to delete cookie");
 
 		snprintf(pi_hole_extra_headers, sizeof(pi_hole_extra_headers),
-		         FTL_DELETE_COOKIE, api->request->is_ssl ? " Secure" : "");
+		         FTL_DELETE_COOKIE, delete_cookie_secure_attr(api->request->is_ssl));
 		cJSON *json = JSON_NEW_OBJECT();
 		get_session_object(api, json, user_id, now);
 		JSON_SEND_OBJECT_CODE(json, 401); // 401 Unauthorized
@@ -580,7 +579,7 @@ int api_auth(struct ftl_conn *api)
 	if(empty_password && (password == NULL || strlen(password) == 0))
 		result = PASSWORD_CORRECT;
 	else
-		result = verify_login(password);
+		result = verify_login(password, api->request->remote_addr);
 
 	if(result == PASSWORD_CORRECT ||
 	   result == APPPASSWORD_CORRECT ||

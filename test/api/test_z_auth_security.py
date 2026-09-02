@@ -1,7 +1,7 @@
 """
 Pi-hole FTL API security regression tests.
 
-These guard three hardening fixes and are intentionally isolated in their own
+These guard hardening fixes and are intentionally isolated in their own
 module (with a self-contained password/TOTP lifecycle) so they do not disturb
 the order-dependent workflow in test_z_auth.py:
 
@@ -9,10 +9,13 @@ the order-dependent workflow in test_z_auth.py:
    SID must not be settable over plaintext HTTP (that would allow it to be
    captured on a single http:// request), and Secure must NOT be added over
    plain HTTP (that would make browsers drop the cookie and break LAN setups).
+   Once a session logged in over TLS, later HTTP refreshes must keep Secure.
 
 2. An accepted TOTP code cannot be replayed. Replay protection tracks the
    accepted RFC 6238 time-step counter, so once a step has been accepted the
    same code can no longer be reused.
+
+3. SIDs are never accepted from the URI query string (leak via Referer/logs).
 
 Usage:
     pytest test/api/test_z_auth_security.py -v
@@ -135,7 +138,7 @@ def teardown_module(_mod):
 # -- tests ------------------------------------------------------------------
 
 class TestSessionCookieSecure:
-    """The Secure cookie attribute must track the transport."""
+    """The Secure cookie attribute must track the transport / login TLS."""
 
     def test_http_login_cookie_has_no_secure_attribute(self):
         r = _login_rate_limited(PASSWORD, base=FTL_URL)
@@ -159,6 +162,45 @@ class TestSessionCookieSecure:
         assert "sid=" in set_cookie, f"no session cookie set: {set_cookie!r}"
         assert "secure" in set_cookie.lower(), \
             f"Secure attribute missing over HTTPS: {set_cookie!r}"
+
+    def test_https_session_keeps_secure_on_http_refresh(self):
+        """A TLS-established session must not lose Secure on HTTP refresh."""
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", InsecureRequestWarning)
+                login = _login_rate_limited(PASSWORD, base=FTL_URL_TLS, verify=False)
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError) as e:
+            pytest.skip(f"HTTPS endpoint not available: {e}")
+        assert login.status_code == 200, f"HTTPS login failed: {login.status_code}"
+        sid = login.json().get("session", {}).get("sid")
+        assert sid, "no SID from HTTPS login"
+        # Refresh the session over plain HTTP using the header SID
+        refresh = requests.get(
+            f"{FTL_URL}/api/auth",
+            headers={"X-FTL-SID": sid},
+            timeout=10)
+        assert refresh.status_code == 200, \
+            f"HTTP refresh failed: {refresh.status_code} {refresh.text}"
+        set_cookie = refresh.headers.get("Set-Cookie", "")
+        if "sid=" in set_cookie:
+            assert "secure" in set_cookie.lower(), \
+                f"Secure dropped after HTTP refresh of TLS session: {set_cookie!r}"
+
+
+class TestSIDNotAcceptedFromURI:
+    """SIDs in the query string must not authenticate."""
+
+    def test_query_string_sid_is_rejected(self):
+        r = _login_rate_limited(PASSWORD)
+        assert r.status_code == 200
+        sid = r.json().get("session", {}).get("sid")
+        assert sid
+        # Present SID only via query string — must not authenticate
+        check = requests.get(f"{FTL_URL}/api/auth?sid={sid}", timeout=10)
+        body = check.json()
+        assert body.get("session", {}).get("valid") is not True, \
+            f"URI SID was accepted: {check.status_code} {check.text}"
 
 
 class TestTOTPReplay:

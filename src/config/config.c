@@ -1097,7 +1097,10 @@ void initConfig(struct config *conf)
 	cJSON_AddItemToArray(conf->webserver.headers.d.json, cJSON_CreateStringReference("X-XSS-Protection: 0"));
 	cJSON_AddItemToArray(conf->webserver.headers.d.json, cJSON_CreateStringReference("X-Content-Type-Options: nosniff"));
 	cJSON_AddItemToArray(conf->webserver.headers.d.json, cJSON_CreateStringReference("Referrer-Policy: strict-origin-when-cross-origin"));
-	conf->webserver.headers.c = validate_stub; // Only type-based checking
+	// Reject CR/LF in header values: they are concatenated with "\r\n" into
+	// CivetWeb's additional_header and would otherwise enable HTTP response
+	// splitting / header injection via authenticated config changes.
+	conf->webserver.headers.c = validate_array_no_newline;
 
 	conf->webserver.serve_all.k = "webserver.serve_all";
 	conf->webserver.serve_all.h = "Should the web server serve all files in webserver.paths.webroot directory?\n\n If disabled, only files within the path defined through webserver.paths.webhome and /api will be served.";

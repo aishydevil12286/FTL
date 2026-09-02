@@ -395,22 +395,84 @@ char * __attribute__((malloc)) create_password(const char *password)
 	return balloon_password(password, salt, true);
 }
 
-enum password_result verify_login(const char *password)
+// Per-IP + soft global rate limit for login attempts. Returns true when the
+// caller should reject with PASSWORD_RATE_LIMITED.
+static bool password_attempts_rate_limited(const char *remote_addr)
+{
+	static pthread_mutex_t rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
+	static struct {
+		char addr[48];
+		time_t second;
+		unsigned int count;
+	} buckets[PASSWORD_RATE_LIMIT_BUCKETS];
+	static time_t global_second = 0;
+	static unsigned int global_count = 0;
+
+	const time_t now = time(NULL);
+	const char *addr = (remote_addr != NULL && remote_addr[0] != '\0')
+	                   ? remote_addr : "unknown";
+
+	// Cheap, stable bucket index from the address string
+	unsigned int hash = 5381;
+	for(const unsigned char *p = (const unsigned char *)addr; *p != '\0'; p++)
+		hash = ((hash << 5) + hash) + *p;
+	const unsigned int idx = hash & (PASSWORD_RATE_LIMIT_BUCKETS - 1);
+
+	pthread_mutex_lock(&rate_limit_lock);
+
+	if(global_second != now)
+	{
+		global_second = now;
+		global_count = 0;
+	}
+	if(++global_count > MAX_PASSWORD_ATTEMPTS_GLOBAL_PER_SECOND)
+	{
+		pthread_mutex_unlock(&rate_limit_lock);
+		sleepms(250);
+		return true;
+	}
+
+	if(strncmp(buckets[idx].addr, addr, sizeof(buckets[idx].addr)) != 0 ||
+	   buckets[idx].second != now)
+	{
+		strncpy(buckets[idx].addr, addr, sizeof(buckets[idx].addr) - 1);
+		buckets[idx].addr[sizeof(buckets[idx].addr) - 1] = '\0';
+		buckets[idx].second = now;
+		buckets[idx].count = 0;
+	}
+
+	if(++buckets[idx].count > MAX_PASSWORD_ATTEMPTS_PER_SECOND)
+	{
+		pthread_mutex_unlock(&rate_limit_lock);
+		sleepms(250);
+		return true;
+	}
+
+	pthread_mutex_unlock(&rate_limit_lock);
+	return false;
+}
+
+enum password_result verify_login(const char *password, const char *remote_addr)
 {
 	// Check if this is the CLI password
 	if(config.webserver.api.cli_pw.v.b && cli_password != NULL)
 	{
-		if(strcmp(cli_password, password) == 0)
+		if(password != NULL && strcmp(cli_password, password) == 0)
 			return CLIPASSWORD_CORRECT;
 	}
 
-	enum password_result pw = verify_password(password, config.webserver.api.pwhash.v.s, true);
+	if(password_attempts_rate_limited(remote_addr))
+		return PASSWORD_RATE_LIMITED;
+
+	// Rate limiting is applied once above so the main + app password checks
+	// below do not double-count a single login attempt.
+	enum password_result pw = verify_password(password, config.webserver.api.pwhash.v.s, false);
 	log_debug(DEBUG_API, "Password %s correct", pw == PASSWORD_CORRECT ? "" : "not");
 
 	// Check if an application password is set and if it matches
 	if(pw == PASSWORD_INCORRECT &&
 	   strlen(config.webserver.api.app_pwhash.v.s) > 0 &&
-	   verify_password(password, config.webserver.api.app_pwhash.v.s, true) == PASSWORD_CORRECT)
+	   verify_password(password, config.webserver.api.app_pwhash.v.s, false) == PASSWORD_CORRECT)
 	{
 		log_debug(DEBUG_API, "App password correct");
 		return APPPASSWORD_CORRECT;
