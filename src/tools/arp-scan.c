@@ -293,7 +293,7 @@ static void add_result(struct in_addr *rcv_ip, unsigned char *sender_mac,
 static ssize_t read_arp(const int fd, struct thread_data *thread_data)
 {
 	ssize_t ret = 0;
-	unsigned char buffer[BUF_SIZE];
+	unsigned char buffer[BUF_SIZE] = { 0 };
 
 	// Read ARP responses
 	while(ret >= 0)
@@ -313,6 +313,12 @@ static ssize_t read_arp(const int fd, struct thread_data *thread_data)
 			printf("recvfrom(): %s", thread_data->error);
 			break;
 		}
+		// Ignore anything shorter than an Ethernet header plus ARP payload:
+		// too short to safely cast/dereference below, and re-parsing
+		// leftover/uninitialized buffer contents from a previous read would
+		// produce bogus results.
+		if ((size_t)ret < ETH2_HEADER_LEN + sizeof(struct arp_header))
+			continue;
 		struct ethhdr *rcv_resp = (struct ethhdr *) buffer;
 		struct arp_header *arp_resp = (struct arp_header *) (buffer + ETH2_HEADER_LEN);
 		if (ntohs(rcv_resp->h_proto) != PROTO_ARP)

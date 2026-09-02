@@ -210,7 +210,10 @@ int api_padd(struct ftl_conn *api)
 		unsigned int v4_addrs = 0, v6_addrs = 0;
 		cJSON_ArrayForEach(entry, interfaces)
 		{
-			if(strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(entry, "name")), gw_v4_name) == 0)
+			// gw_v4_name is NULL when no default IPv4 route was found above;
+			// skip the comparison rather than pass NULL to strcmp() (UB/crash).
+			if(gw_v4_name != NULL &&
+			   strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(entry, "name")), gw_v4_name) == 0)
 			{
 				// Add first interface address with family == inet
 				cJSON *addr = NULL;
@@ -240,7 +243,10 @@ int api_padd(struct ftl_conn *api)
 				cJSON *tx_bytes = cJSON_GetObjectItemCaseSensitive(stats, "tx_bytes");
 				JSON_ADD_ITEM_TO_OBJECT(iface_v4, "tx_bytes", cJSON_Duplicate(tx_bytes, true));
 			}
-			if(strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(entry, "name")), gw_v6_name) == 0)
+			// gw_v6_name is NULL when no default IPv4 or IPv6 route was found
+			// above; skip the comparison rather than pass NULL to strcmp().
+			if(gw_v6_name != NULL &&
+			   strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(entry, "name")), gw_v6_name) == 0)
 			{
 				// Add first interface address with family == inet
 				cJSON *addr = NULL;
