@@ -879,7 +879,13 @@ static size_t process_reply(struct dns_header *header, time_t now, struct server
 	      cache_secure = 0;
 	      // Generate DNS packet for reply, a possibly existing pseudo header
 	      // will be restored later inside resize_packet()
-	      n = FTL_make_answer(header, ((char *) header) + 65536, n, ede_data, &ede_len);
+	      // Use outlen (the caller-supplied true size of the buffer "header"
+	      // points into: daemon->edns_pktsz for the UDP path, 65536 for the
+	      // TCP path's bigbuff) instead of a hardcoded 65536, which overstated
+	      // the available headroom on the UDP path and allowed
+	      // FTL_make_answer()/add_resource_record() to write past the end of
+	      // the real allocation (daemon->packet).
+	      n = FTL_make_answer(header, ((char *) header) + outlen, n, ede_data, &ede_len);
 	    }
 	}
       
