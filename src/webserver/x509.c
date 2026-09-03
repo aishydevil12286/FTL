@@ -11,6 +11,10 @@
 #include "FTL.h"
 #include "log.h"
 #include "x509.h"
+// get_secure_randomness() -- declared directly rather than including
+// config/password.h, which also declares functions taking a forward-only
+// "struct conf_item *" that isn't defined in this translation unit
+bool get_secure_randomness(uint8_t *buffer, const size_t length);
 
 #ifdef HAVE_MBEDTLS
 # ifndef MBEDTLS_MPI_INIT
@@ -179,18 +183,26 @@ bool generate_certificate(const char* certfile, bool rsa, const char *domain, co
 	// CA (i.e., the issuer name and serial number identify a unique
 	// certificate).
 	// We generate a random string of 16 digits, which should be unique enough
-	// for our purposes. We use the same random number generator as for the
-	// key generation to ensure that the serial number is not predictable.
+	// for our purposes. We use get_secure_randomness() (the same CSPRNG path
+	// used for password salts/session tokens elsewhere) rather than rand(),
+	// which is seeded once at startup from time+pid and is not suitable for
+	// anything where unpredictability matters.
 	// The serial number could be a constant, e.g., 1, but this would allow
 	// only one certificate being issued with a given browser. Any new generated
 	// certificate would be rejected by the browser as it would have the same
 	// serial number as the previous one and uniques is violated.
 	unsigned char serial1[16] = { 0 }, serial2[16] = { 0 };
+	uint8_t serial_rand[2 * (sizeof(serial1) - 1)] = { 0 };
+	if(!get_secure_randomness(serial_rand, sizeof(serial_rand)))
+	{
+		printf("ERROR: Failed to generate random certificate serial numbers\n");
+		return false;
+	}
 	for(unsigned int i = 0; i < sizeof(serial1) - 1; i++)
-		serial1[i] = '0' + (rand() % 10);
+		serial1[i] = '0' + (serial_rand[i] % 10);
 	serial1[sizeof(serial1) - 1] = '\0';
 	for(unsigned int i = 0; i < sizeof(serial2) - 1; i++)
-		serial2[i] = '0' + (rand() % 10);
+		serial2[i] = '0' + (serial_rand[sizeof(serial1) - 1 + i] % 10);
 	serial2[sizeof(serial2) - 1] = '\0';
 
 	// Create validity period

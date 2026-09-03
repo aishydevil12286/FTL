@@ -157,11 +157,35 @@ tre_tnfa_run_parallel(const tre_tnfa_t *tnfa, const void *string, int len,
   {
     int tbytes, rbytes, pbytes, xbytes, total_bytes;
     char *tmp_buf;
-    /* Compute the length of the block we need. */
-    tbytes = sizeof(*tmp_tags) * num_tags;
-    rbytes = sizeof(*reach_next) * (tnfa->num_states + 1);
-    pbytes = sizeof(*reach_pos) * tnfa->num_states;
-    xbytes = sizeof(int) * num_tags;
+    /* Compute the length of the block we need. This used to be done in
+       plain `int` arithmetic: with a compiled regex whose num_states/
+       num_tags are large enough (reachable from a sufficiently complex
+       admin-supplied pattern), the multiplications below -- particularly
+       the num_states*num_tags cross term -- can overflow a 32-bit int and
+       wrap to a small or negative value. The loop that fills reach[]/
+       reach_next[] below still runs num_states times regardless, so an
+       undersized allocation from a wrapped total_bytes becomes a heap
+       buffer overflow. Compute in size_t and reject anything that would
+       overflow or that no realistic regex should need. */
+    {
+      const size_t st_tbytes = (size_t)sizeof(*tmp_tags) * (size_t)num_tags;
+      const size_t st_rbytes = (size_t)sizeof(*reach_next) * ((size_t)tnfa->num_states + 1);
+      const size_t st_pbytes = (size_t)sizeof(*reach_pos) * (size_t)tnfa->num_states;
+      const size_t st_xbytes = sizeof(int) * (size_t)num_tags;
+      /* Cap well below SIZE_MAX/INT_MAX so the additions/paddings below
+         can't overflow either, while still being far larger than any
+         legitimate compiled regex would ever need. */
+      const size_t sane_cap = (size_t)1 << 28; /* 256 MiB per term */
+      if (st_tbytes > sane_cap || st_rbytes > sane_cap || st_pbytes > sane_cap ||
+	  st_xbytes > sane_cap ||
+	  st_xbytes > sane_cap / ((size_t)tnfa->num_states + 1) ||
+	  (st_rbytes + st_xbytes * (size_t)tnfa->num_states) * 2 > sane_cap)
+	return REG_ESPACE;
+      tbytes = (int)st_tbytes;
+      rbytes = (int)st_rbytes;
+      pbytes = (int)st_pbytes;
+      xbytes = (int)st_xbytes;
+    }
     total_bytes =
       (sizeof(long) - 1) * 4 /* for alignment paddings */
       + (rbytes + xbytes * tnfa->num_states) * 2 + tbytes + pbytes;

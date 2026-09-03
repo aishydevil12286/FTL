@@ -28,6 +28,8 @@
 #include <nettle/base64.h>
 #include <nettle/version.h>
 #include <nettle/balloon.h>
+// constant-time memeql_sec()
+#include <nettle/memops.h>
 
 // Salt length for balloon hashing
 // The purpose of including salts is to modify the function used to hash each
@@ -200,6 +202,8 @@ static uint8_t * __attribute__((malloc)) base64_decode(const char *data, size_t 
 // Otherwise, the output will be the raw password hash
 static char * __attribute__((malloc)) balloon_password(const char *password,
                                                        const uint8_t salt[SALT_LEN],
+                                                       const size_t s_cost,
+                                                       const size_t t_cost,
                                                        const bool phc_string)
 {
 	// Parameter check
@@ -211,19 +215,14 @@ static char * __attribute__((malloc)) balloon_password(const char *password,
 	if(config.debug.api.v.b)
 		clock_gettime(CLOCK_MONOTONIC, &start);
 
-	// The space parameter s_cost determines how many blocks of working
-	// space the algorithm will require during its computation.  It is
-	// common to set s_cost to a high value in order to increase the cost of
-	// hardware accelerators built by the adversary.
-	// The algorithm will need (s_cost + 1) * digest_size
+	// s_cost (space) and t_cost (time) are supplied by the caller:
+	// create_password() uses PASSWORD_DEFAULT_S_COST/T_COST below for new
+	// hashes, verify_password() uses whatever was recorded in the PHC
+	// string being checked, so an existing hash keeps verifying against the
+	// cost it was actually created with even if the defaults change later.
+	//
+	// The algorithm needs (s_cost + 1) * digest_size of scratch space
 	//    -> 32KB for s_cost = 1024 and algo = SHA256
-	const size_t s_cost = 1024;
-
-	// The time parameter t_cost determines the number of rounds of
-	// computation that the algorithm will perform. This can be used to
-	// further increase the cost of computation without raising the memory
-	// requirement.
-	const size_t t_cost = 32;
 
 	// Scratch buffer scratch is a user allocated working space required by
 	// the algorithm.  To determine the required size of the scratch buffer
@@ -281,13 +280,21 @@ static char * __attribute__((malloc)) balloon_password(const char *password,
 	}
 
 clean_and_exit:
-	// Clean up
+	// Clean up. scratch/scratch_base64 hold the raw and base64-encoded
+	// password-derived hash respectively; scrub them before freeing so
+	// they don't linger, readable, in freed heap memory.
 	if(scratch != NULL)
+	{
+		explicit_bzero(scratch, balloon_itch(SHA256_DIGEST_SIZE, s_cost));
 		free(scratch);
+	}
 	if(salt_base64 != NULL)
 		free(salt_base64);
 	if(scratch_base64 != NULL)
+	{
+		explicit_bzero(scratch_base64, strlen(scratch_base64));
 		free(scratch_base64);
+	}
 
 	return output; // may be NULL on failure (unlikely)
 }
@@ -329,6 +336,19 @@ static bool parse_PHC_string(const char *phc, size_t *s_cost, size_t *t_cost, ui
 	{
 		// Error
 		log_err("Error while parsing PHC string: Found %d instead of 6 elements in definition", size);
+		return false;
+	}
+
+	// Sanity-bound the cost parameters before they're used to size a
+	// calloc() and drive balloon_sha256()'s work below: a corrupted or
+	// tampered-with pwhash value with an absurd s_cost/t_cost would
+	// otherwise translate directly into unbounded memory/CPU use on every
+	// login attempt. Even the strongest realistic parameters need nowhere
+	// near this much.
+	if(*s_cost == 0 || *s_cost > 1000000 || *t_cost == 0 || *t_cost > 1000000)
+	{
+		log_err("Rejecting PHC string with out-of-range cost parameters (s=%zu, t=%zu)",
+		        *s_cost, *t_cost);
 		return false;
 	}
 
@@ -383,6 +403,34 @@ static bool parse_PHC_string(const char *phc, size_t *s_cost, size_t *t_cost, ui
 	return true;
 }
 
+// Cost parameters for newly created password hashes.
+//
+// s_cost (space) determines the scratch-buffer size the algorithm needs:
+// (s_cost + 1) * digest_size, i.e. ~128KB for s_cost = 4096 with SHA256 --
+// 4x the previous s_cost = 1024 (~32KB), which starts to meaningfully
+// constrain GPU-parallel cracking (GPU cores typically have on the order of
+// tens to a couple hundred KB of fast memory each). t_cost is left
+// unchanged.
+//
+// A much larger jump (s_cost = 16384, t_cost = 64, ~32x the original
+// compute cost) was tried first and measured directly against this build:
+// it pushed a single POST /api/auth to ~5 real seconds. That is both a poor
+// interactive login experience and a self-inflicted DoS risk (each
+// concurrent login attempt ties up a webserver worker thread for that long,
+// and the login endpoint is necessarily reachable pre-authentication). This
+// more moderate setting was chosen to raise the cost of offline cracking
+// meaningfully without regressing login latency to something that itself
+// becomes a liability -- verify against real target hardware (this project
+// explicitly supports low-power boards like the Raspberry Pi Zero) before
+// raising it further.
+//
+// These are only used for hashes created from here on: verify_password()
+// always re-derives the cost from the s=/t= fields already recorded in the
+// hash being checked, so raising these later does not require, and will not
+// break, re-hashing any existing password.
+#define PASSWORD_DEFAULT_S_COST 4096
+#define PASSWORD_DEFAULT_T_COST 32
+
 char * __attribute__((malloc)) create_password(const char *password)
 {
 	// Generate a 128 bit random salt
@@ -392,13 +440,13 @@ char * __attribute__((malloc)) create_password(const char *password)
 		return strdup("");
 
 	// Generate balloon PHC-encoded password hash
-	return balloon_password(password, salt, true);
+	return balloon_password(password, salt, PASSWORD_DEFAULT_S_COST, PASSWORD_DEFAULT_T_COST, true);
 }
 
 // Shared state for password_attempts_rate_limited()/password_attempts_release()
 // below. File-scope (not function-local) so a successful login can undo its
 // own accounting after the fact -- see password_attempts_release().
-static pthread_mutex_t rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t login_rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct {
 	char addr[48];
 	time_t second;
@@ -408,7 +456,7 @@ static time_t rate_limit_global_second = 0;
 static unsigned int rate_limit_global_count = 0;
 
 // Cheap, stable bucket index from an address string
-static unsigned int password_rate_limit_bucket(const char *addr)
+static unsigned int __attribute__((pure)) password_rate_limit_bucket(const char *addr)
 {
 	unsigned int hash = 5381;
 	for(const unsigned char *p = (const unsigned char *)addr; *p != '\0'; p++)
@@ -425,7 +473,7 @@ static bool password_attempts_rate_limited(const char *remote_addr)
 	                   ? remote_addr : "unknown";
 	const unsigned int idx = password_rate_limit_bucket(addr);
 
-	pthread_mutex_lock(&rate_limit_lock);
+	pthread_mutex_lock(&login_rate_limit_lock);
 
 	if(rate_limit_global_second != now)
 	{
@@ -434,7 +482,7 @@ static bool password_attempts_rate_limited(const char *remote_addr)
 	}
 	if(++rate_limit_global_count > MAX_PASSWORD_ATTEMPTS_GLOBAL_PER_SECOND)
 	{
-		pthread_mutex_unlock(&rate_limit_lock);
+		pthread_mutex_unlock(&login_rate_limit_lock);
 		sleepms(250);
 		return true;
 	}
@@ -450,12 +498,12 @@ static bool password_attempts_rate_limited(const char *remote_addr)
 
 	if(++rate_limit_buckets[idx].count > MAX_PASSWORD_ATTEMPTS_PER_SECOND)
 	{
-		pthread_mutex_unlock(&rate_limit_lock);
+		pthread_mutex_unlock(&login_rate_limit_lock);
 		sleepms(250);
 		return true;
 	}
 
-	pthread_mutex_unlock(&rate_limit_lock);
+	pthread_mutex_unlock(&login_rate_limit_lock);
 	return false;
 }
 
@@ -474,13 +522,13 @@ static void password_attempts_release(const char *remote_addr)
 	                   ? remote_addr : "unknown";
 	const unsigned int idx = password_rate_limit_bucket(addr);
 
-	pthread_mutex_lock(&rate_limit_lock);
+	pthread_mutex_lock(&login_rate_limit_lock);
 	if(rate_limit_global_count > 0)
 		rate_limit_global_count--;
 	if(strncmp(rate_limit_buckets[idx].addr, addr, sizeof(rate_limit_buckets[idx].addr)) == 0 &&
 	   rate_limit_buckets[idx].count > 0)
 		rate_limit_buckets[idx].count--;
-	pthread_mutex_unlock(&rate_limit_lock);
+	pthread_mutex_unlock(&login_rate_limit_lock);
 }
 
 enum password_result verify_login(const char *password, const char *remote_addr)
@@ -559,7 +607,10 @@ enum password_result verify_password(const char *password, const char *pwhash, c
 	// Check password hash format
 	if(pwhash[0] == '$')
 	{
-		// Parse PHC string
+		// Parse PHC string. s_cost/t_cost come from the hash being checked
+		// (not the current PASSWORD_DEFAULT_S_COST/T_COST), so a stored
+		// hash always keeps verifying correctly even after those defaults
+		// change for newly created hashes.
 		size_t s_cost = 0;
 		size_t t_cost = 0;
 		uint8_t *salt = NULL;
@@ -568,10 +619,15 @@ enum password_result verify_password(const char *password, const char *pwhash, c
 			return PASSWORD_INCORRECT;
 		if(salt == NULL || config_hash == NULL)
 			return PASSWORD_INCORRECT;
-		char *supplied = balloon_password(password, salt, false);
-		const bool result = memcmp(config_hash, supplied, SHA256_DIGEST_SIZE) == 0;
+		char *supplied = balloon_password(password, salt, s_cost, t_cost, false);
+		// Constant-time comparison: a digest comparison is exactly the kind
+		// of secret-dependent branch timing attacks target.
+		const bool result = memeql_sec(config_hash, supplied, SHA256_DIGEST_SIZE) != 0;
 
-		// Free allocated memory
+		// Free allocated memory. supplied holds the freshly-derived hash of
+		// the caller-supplied password; scrub it before freeing so it
+		// doesn't linger, readable, in freed heap memory.
+		explicit_bzero(supplied, balloon_itch(SHA256_DIGEST_SIZE, s_cost));
 		free(supplied);
 		free(salt);
 		free(config_hash);
@@ -584,9 +640,14 @@ enum password_result verify_password(const char *password, const char *pwhash, c
 	}
 	else
 	{
-		// Legacy password
+		// Legacy password. Both sides are always double_sha256_password()'s
+		// fixed-length hex output, but length-check before the constant-time
+		// compare anyway so a malformed/corrupted pwhash can't cause it to
+		// read past either buffer.
 		char *supplied = double_sha256_password(password);
-		const bool result = strcmp(pwhash, supplied) == 0;
+		const bool result = strlen(pwhash) == strlen(supplied) &&
+		                     memeql_sec(pwhash, supplied, strlen(supplied)) != 0;
+		explicit_bzero(supplied, strlen(supplied));
 		free(supplied);
 
 		// Upgrade double-hashed password to BALLOON hash
@@ -857,7 +918,7 @@ bool generate_password(char **password, char **pwhash)
 		return false;
 
 	// Generate balloon PHC-encoded password hash
-	*pwhash = balloon_password(*password, salt, true);
+	*pwhash = balloon_password(*password, salt, PASSWORD_DEFAULT_S_COST, PASSWORD_DEFAULT_T_COST, true);
 
 	// Verify that the password hash is valid
 	if(verify_password(*password, *pwhash, false) != PASSWORD_CORRECT)

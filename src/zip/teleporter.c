@@ -63,6 +63,112 @@ static const char *ftl_tables[] = {
 	"network_addresses"
 };
 
+// Config keys that must never leave the device in a Teleporter export.
+// Unlike history/gravity data (sensitive, but not directly an admin
+// bypass), these let anyone who obtains the exported ZIP authenticate as
+// the Pi-hole admin (pwhash/app_pwhash) or mint valid 2FA codes
+// (totp_secret) without needing to crack anything -- and the ZIP itself
+// is never encrypted (the bundled miniz library has no encryption
+// support), so once it's downloaded it's an ordinary file that can end up
+// in a Downloads folder, an email attachment, or a cloud drive.
+// "password" is a write-only pseudo-item that's always "" at rest (it
+// immediately computes pwhash and clears itself), but it's included here
+// defensively in case that ever changes.
+static const char *const teleporter_redact_keys[] = {
+	"pwhash",
+	"app_pwhash",
+	"totp_secret",
+	"password",
+	NULL
+};
+
+// Returns a newly malloc'd copy of a pihole.toml buffer with every
+// teleporter_redact_keys[] line removed entirely (not blanked to an empty
+// string). This distinction matters on import:
+// test_and_import_pihole_toml() starts from a duplicate of the *running*
+// configuration and applies readTOMLvalue() (toml_helper.c) per key, which
+// only overwrites a field when the key is actually present with a
+// matching-type value in the imported TOML -- an absent key leaves the
+// duplicated (i.e. current) value untouched. A blanked `pwhash = ""` line
+// is very much "present with a matching-type value" (an empty TOML string
+// is still a TOML_STRING), so it WOULD overwrite the receiving instance's
+// real password hash with an empty one -- verified empirically: an earlier
+// version of this function blanked rather than removed these lines, and a
+// restore onto a machine with a real password silently wiped it. Removing
+// the line instead means the key genuinely doesn't exist in the parsed
+// table, so it's skipped and the receiving instance's existing
+// credentials are left alone, while the secret value itself still never
+// appears anywhere in the exported archive.
+// *out_size receives the length of the returned buffer, which is always
+// <= size since redaction only ever removes bytes. Returns NULL (and
+// leaves *out_size unset) on allocation failure.
+static char *redact_teleporter_toml(const char *buf, const size_t size, size_t *out_size)
+{
+	char *out = calloc(size + 1, sizeof(char));
+	if(out == NULL)
+		return NULL;
+
+	size_t out_len = 0;
+	size_t i = 0;
+	while(i < size)
+	{
+		// Extent of the current line, newline excluded
+		const size_t line_start = i;
+		while(i < size && buf[i] != '\n')
+			i++;
+		const size_t line_end = i;
+
+		// Skip leading whitespace to find where a key would start (FTL's
+		// TOML writer indents keys under their [section] with spaces)
+		size_t key_start = line_start;
+		while(key_start < line_end && (buf[key_start] == ' ' || buf[key_start] == '\t'))
+			key_start++;
+
+		bool redacted = false;
+		for(unsigned int k = 0; teleporter_redact_keys[k] != NULL; k++)
+		{
+			const size_t klen = strlen(teleporter_redact_keys[k]);
+			if(key_start + klen > line_end ||
+			   strncmp(buf + key_start, teleporter_redact_keys[k], klen) != 0)
+				continue;
+
+			// Confirm this is a "<key> = ..." line and not merely some
+			// other key sharing this prefix (e.g. a hypothetical
+			// "pwhash_foo"): the next non-whitespace character after the
+			// matched key must be '='
+			size_t after_key = key_start + klen;
+			while(after_key < line_end && (buf[after_key] == ' ' || buf[after_key] == '\t'))
+				after_key++;
+			if(after_key >= line_end || buf[after_key] != '=')
+				continue;
+
+			// Matched: drop this line entirely (see the function comment
+			// above for why removal, not blanking, is required here)
+			redacted = true;
+			break;
+		}
+
+		if(!redacted)
+		{
+			memcpy(out + out_len, buf + line_start, line_end - line_start);
+			out_len += line_end - line_start;
+		}
+
+		if(i < size)
+		{
+			// Always step past the newline itself; only copy it into the
+			// output when the line it terminated was kept, so a dropped
+			// line doesn't leave a blank line behind in its place
+			if(!redacted)
+				out[out_len++] = buf[i];
+			i++;
+		}
+	}
+
+	*out_size = out_len;
+	return out;
+}
+
 // Copy a message into the ERRBUF_SIZE-sized hint buffer, always leaving it
 // NUL-terminated (plain strncpy(hint, src, ERRBUF_SIZE) would not terminate
 // when src is ERRBUF_SIZE bytes or longer, e.g. a long SQLite error message)
@@ -171,10 +277,54 @@ const char *generate_teleporter_zip(mz_zip_archive *zip, char filename[128], voi
 		return "Failed creating heap ZIP archive";
 	}
 
-	// Add pihole.toml to the ZIP archive
+	// Add a redacted copy of pihole.toml to the ZIP archive. The Teleporter
+	// ZIP is never encrypted (see redact_teleporter_toml() above for why),
+	// so the password hash, app password hash and TOTP secret it would
+	// otherwise contain in the clear are stripped before the file is added
+	// -- not read back out of an already-written archive, so an
+	// unredacted copy is never written to disk or held any longer than
+	// necessary.
 	const char *file_comment = "Pi-hole's configuration";
 	const char *file_path = GLOBALTOMLPATH;
-	if(!mz_zip_writer_add_file(zip, file_path+1, file_path, file_comment, (uint16_t)strlen(file_comment), MZ_BEST_COMPRESSION))
+	FILE *toml_fp = fopen(file_path, "rb");
+	if(toml_fp == NULL)
+	{
+		mz_zip_writer_end(zip);
+		return "Failed to open "GLOBALTOMLPATH" for the heap ZIP archive!";
+	}
+	fseek(toml_fp, 0, SEEK_END);
+	const long toml_filesize = ftell(toml_fp);
+	fseek(toml_fp, 0, SEEK_SET);
+	if(toml_filesize < 0)
+	{
+		fclose(toml_fp);
+		mz_zip_writer_end(zip);
+		return "Failed to determine size of "GLOBALTOMLPATH" for the heap ZIP archive!";
+	}
+	char *toml_buf = malloc((size_t)toml_filesize);
+	if(toml_buf == NULL || fread(toml_buf, 1, (size_t)toml_filesize, toml_fp) != (size_t)toml_filesize)
+	{
+		free(toml_buf);
+		fclose(toml_fp);
+		mz_zip_writer_end(zip);
+		return "Failed to read "GLOBALTOMLPATH" for the heap ZIP archive!";
+	}
+	fclose(toml_fp);
+
+	size_t redacted_size = 0;
+	char *redacted_toml = redact_teleporter_toml(toml_buf, (size_t)toml_filesize, &redacted_size);
+	free(toml_buf);
+	if(redacted_toml == NULL)
+	{
+		mz_zip_writer_end(zip);
+		return "Failed to redact "GLOBALTOMLPATH" for the heap ZIP archive!";
+	}
+
+	const bool toml_added = mz_zip_writer_add_mem_ex(zip, file_path+1, redacted_toml, redacted_size,
+	                                                 file_comment, (uint16_t)strlen(file_comment),
+	                                                 MZ_BEST_COMPRESSION, 0, 0);
+	free(redacted_toml);
+	if(!toml_added)
 	{
 		mz_zip_writer_end(zip);
 		return "Failed to add "GLOBALTOMLPATH" to heap ZIP archive!";
