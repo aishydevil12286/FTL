@@ -1876,6 +1876,105 @@ setup() {
   run bash -c "rm ${filename}"
 }
 
+@test "Teleporter export excludes pwhash/app_pwhash/totp_secret" {
+  # Set known, recognizable sentinel values for every credential field the
+  # Teleporter archive must never contain (see redact_teleporter_toml() in
+  # src/zip/teleporter.c). "password" is FLAG_PSEUDO_ITEM and always
+  # resolves back to "" at rest, so it is not set here -- there is no
+  # persisted value for it to leak.
+  logsize_before=$(stat -c%s /var/log/pihole/FTL.log)
+  run bash -c './pihole-FTL --config webserver.api.pwhash "\$BALLOON-SHA256\$v=1\$s=4096,t=32\$c2FsdGZha2Uy\$aGFzaGZha2Uy"'
+  assert_success
+  run bash -c './pihole-FTL --config webserver.api.totp_secret JBSWY3DPEHPK3PXP'
+  assert_success
+  run bash -c './pihole-FTL --config webserver.api.app_pwhash "\$BALLOON-SHA256\$v=1\$s=4096,t=32\$YXBwc2FsdA==\$YXBwaGFzaA=="'
+  assert_success
+  run bash -c "./pihole-FTL wait-for 'pihole.toml unchanged' /var/log/pihole/FTL.log 5 $logsize_before"
+  assert_success
+
+  # Export
+  run bash -c './pihole-FTL --teleporter'
+  assert_success
+  filename="${lines[-1]}"
+
+  # The exported archive's pihole.toml must contain neither the sentinel
+  # secret values nor the (now-empty, but still present-with-a-value)
+  # pwhash/app_pwhash/totp_secret keys themselves -- see
+  # redact_teleporter_toml()'s comment for why the lines are removed
+  # rather than blanked.
+  run bash -c "python3 -c \"import zipfile; print(zipfile.ZipFile('${filename}').read('etc/pihole/pihole.toml').decode())\""
+  assert_success
+  refute_output --partial "aGFzaGZha2Uy"
+  refute_output --partial "JBSWY3DPEHPK3PXP"
+  refute_output --partial "YXBwaGFzaA=="
+  refute_output --partial "pwhash ="
+  refute_output --partial "app_pwhash ="
+  refute_output --partial "totp_secret ="
+
+  # Clean up: remove the archive and the sentinel config values
+  run bash -c "rm ${filename}"
+  logsize_before=$(stat -c%s /var/log/pihole/FTL.log)
+  run bash -c './pihole-FTL --config webserver.api.pwhash ""'
+  assert_success
+  run bash -c './pihole-FTL --config webserver.api.totp_secret ""'
+  assert_success
+  run bash -c './pihole-FTL --config webserver.api.app_pwhash ""'
+  assert_success
+  run bash -c "./pihole-FTL wait-for 'pihole.toml unchanged' /var/log/pihole/FTL.log 5 $logsize_before"
+  assert_success
+}
+
+@test "Teleporter import does not overwrite existing pwhash/totp_secret" {
+  # Set an initial pwhash/totp_secret, export, then change both to a
+  # *different* sentinel value before importing that same export back in.
+  # If the importer applied the archive's (redacted, key-absent)
+  # pwhash/totp_secret, these would revert to empty; readTOMLvalue() only
+  # overwrites a field when its key is present in the imported TOML, so
+  # the post-import value must still be the second sentinel, unchanged by
+  # the import.
+  logsize_before=$(stat -c%s /var/log/pihole/FTL.log)
+  run bash -c './pihole-FTL --config webserver.api.pwhash "\$BALLOON-SHA256\$v=1\$s=4096,t=32\$c2FsdGZha2Uy\$c2VudGluZWwx"'
+  assert_success
+  run bash -c './pihole-FTL --config webserver.api.totp_secret JBSWY3DPEHPK3PXP'
+  assert_success
+  run bash -c "./pihole-FTL wait-for 'pihole.toml unchanged' /var/log/pihole/FTL.log 5 $logsize_before"
+  assert_success
+
+  run bash -c './pihole-FTL --teleporter'
+  assert_success
+  filename="${lines[-1]}"
+
+  logsize_before=$(stat -c%s /var/log/pihole/FTL.log)
+  run bash -c './pihole-FTL --config webserver.api.pwhash "\$BALLOON-SHA256\$v=1\$s=4096,t=32\$c2FsdGZha2Uy\$c2VudGluZWwy"'
+  assert_success
+  run bash -c "./pihole-FTL wait-for 'pihole.toml unchanged' /var/log/pihole/FTL.log 5 $logsize_before"
+  assert_success
+
+  run bash -c "./pihole-FTL --teleporter ${filename}"
+  assert_success
+
+  run bash -c './pihole-FTL --config webserver.api.pwhash'
+  # "c2VudGluZWwy" is the base64 encoding of "sentinel2" (the salt/hash
+  # fields above are themselves base64), matching the second --config call
+  # above
+  assert_line --partial --index 0 "c2VudGluZWwy"
+  # totp_secret is FLAG_WRITE_ONLY, so the CLI never echoes its value back;
+  # a masked, non-empty readout confirms it is still set at all (i.e. not
+  # reset to empty by the import).
+  run bash -c './pihole-FTL --config webserver.api.totp_secret'
+  refute_output ""
+
+  # Clean up
+  run bash -c "rm ${filename}"
+  logsize_before=$(stat -c%s /var/log/pihole/FTL.log)
+  run bash -c './pihole-FTL --config webserver.api.pwhash ""'
+  assert_success
+  run bash -c './pihole-FTL --config webserver.api.totp_secret ""'
+  assert_success
+  run bash -c "./pihole-FTL wait-for 'pihole.toml unchanged' /var/log/pihole/FTL.log 5 $logsize_before"
+  assert_success
+}
+
 # NOTE: Config file rotation count test moved to test_final.bats
 
 @test "Suggest expected completions" {
