@@ -246,12 +246,26 @@ static time_t last_attempt = 0;
 // though the code stays numerically valid across the -1..+1 acceptance window.
 static uint64_t last_counter = 0;
 static pthread_mutex_t totp_lock = PTHREAD_MUTEX_INITIALIZER;
+// The 1-attempt-per-second throttle above bounds the *rate* of guessing but
+// not the total number of attempts: at that rate, brute-forcing the full
+// 6-digit code space still only takes a few days. Add a real lockout after
+// repeated wrong codes so a second factor that's actually been guessed at
+// gets caught long before that.
+#define TOTP_MAX_CONSECUTIVE_FAILURES 5
+#define TOTP_LOCKOUT_SECONDS 300
+static unsigned int consecutive_failures = 0;
+static time_t locked_until = 0;
 enum totp_status verifyTOTP(const uint32_t incode)
 {
 	pthread_mutex_lock(&totp_lock);
 
 	// Only one attempt per second is allowed
 	const time_t now = time(NULL);
+	if(now < locked_until)
+	{
+		pthread_mutex_unlock(&totp_lock);
+		return TOTP_RATE_LIMIT;
+	}
 	if(now == last_attempt)
 	{
 		pthread_mutex_unlock(&totp_lock);
@@ -310,9 +324,21 @@ enum totp_status verifyTOTP(const uint32_t incode)
 			const char *which = i == -1 ? "previous" : i == 0 ? "current" : "next";
 			log_debug(DEBUG_API, "2FA code from %s time step is valid", which);
 			last_counter = counter;
+			// A correct code clears any accumulated failure count.
+			consecutive_failures = 0;
+			locked_until = 0;
 			pthread_mutex_unlock(&totp_lock);
 			return TOTP_CORRECT;
 		}
+	}
+
+	// Every path below here is a failed attempt (wrong code or reuse of an
+	// already-accepted one) -- count it towards the lockout threshold.
+	if(++consecutive_failures >= TOTP_MAX_CONSECUTIVE_FAILURES)
+	{
+		locked_until = now + TOTP_LOCKOUT_SECONDS;
+		log_warn("Too many wrong 2FA attempts, locking out further attempts for %d seconds",
+		         TOTP_LOCKOUT_SECONDS);
 	}
 
 	if(reused)

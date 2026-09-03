@@ -2366,6 +2366,28 @@ bool gravityDB_readTable(const enum gravity_list_type listtype,
 		return false;
 	}
 
+	// ids is spliced directly into the query text below as "AND id IN
+	// (ids)" -- SQLite has no way to bind a variable-length list of values
+	// through a single prepared-statement parameter, so string
+	// concatenation is unavoidable here. What we CAN do is make sure only
+	// digits/commas ever reach that concatenation: every current caller
+	// builds ids from internally-generated integer IDs, but validating here
+	// (rather than trusting callers to always keep it that way) closes the
+	// class of bug outright rather than by convention.
+	if(ids != NULL)
+	{
+		for(const char *p = ids; *p != '\0'; p++)
+		{
+			if(!isdigit((unsigned char)*p) && *p != ',')
+			{
+				*message = "Invalid (non-numeric) id list";
+				log_err("gravityDB_readTable(%d): Rejecting non-numeric ids filter: %s",
+				        listtype, ids);
+				return false;
+			}
+		}
+	}
+
 	// Get filter string for the requested list type
 	const char *type = "N/A";
 	switch (listtype)
@@ -2547,20 +2569,10 @@ bool gravityDB_readTable(const enum gravity_list_type listtype,
 		return false;
 	}
 
-	// Bind ids to prepared statement (if requested)
-	idx = sqlite3_bind_parameter_index(*read_stmt_p, ":ids");
-	if(idx > 0 && (rc = sqlite3_bind_text(*read_stmt_p, idx, ids, -1, SQLITE_STATIC)) != SQLITE_OK)
-	{
-		*message = sqlite3_errmsg(gravity_db);
-		log_err("gravityDB_readTable(%d => (%s), %s): Failed to bind ids (error %d) - %s",
-		        listtype, type, like_name, rc, *message);
-		sqlite3_finalize(*read_stmt_p);
-		*read_stmt_p = NULL;
-		if(!exact)
-			free(like_name);
-		free(querystr);
-		return false;
-	}
+	// Note: there is deliberately no ":ids" bind step here. ids is spliced
+	// into querystr above (as validated, digits/commas-only text), not
+	// passed as a bound parameter -- see the validation and comment earlier
+	// in this function for why.
 
 	// Debug output
 	if(config.debug.api.v.b)
