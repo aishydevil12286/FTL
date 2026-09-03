@@ -1302,6 +1302,47 @@ bool replace_queries_view_with_joins(sqlite3 *db)
 	return true;
 }
 
+bool add_query_storage_indexes(sqlite3 *db)
+{
+	// Start transaction of database update
+	SQL_bool(db, "BEGIN");
+
+	// Add indexes on query_storage matching the ones already created on
+	// the in-memory database (see index_creation[] above) for every
+	// column the API's Query Log filters/sorts on (src/api/queries.c:
+	// domain, client, type, status, reply_type, dnssec -- via
+	// d.domain/c.ip/c.name/q.type/q.status/q.reply_type/q.dnssec).
+	//
+	// Without these, only queries within the in-memory window (the last
+	// 24 hours, MAXLOGAGE) benefit from an index; every filtered lookup
+	// reaching further back into the on-disk history (up to
+	// database.maxDBdays, 91 days by default -- the overwhelming
+	// majority of a typical install's retained queries) fell back to a
+	// full table scan of query_storage. id is deliberately NOT
+	// re-indexed here: it is already an alias for the table's rowid
+	// (INTEGER PRIMARY KEY), so a separate index on it would only add
+	// write overhead with no query-planning benefit.
+	SQL_bool(db, CREATE_QUERY_STORAGE_TYPE_INDEX);
+	SQL_bool(db, CREATE_QUERY_STORAGE_STATUS_INDEX);
+	SQL_bool(db, CREATE_QUERY_STORAGE_DOMAIN_INDEX);
+	SQL_bool(db, CREATE_QUERY_STORAGE_CLIENT_INDEX);
+	SQL_bool(db, CREATE_QUERY_STORAGE_REPLY_TYPE_INDEX);
+	SQL_bool(db, CREATE_QUERY_STORAGE_DNSSEC_INDEX);
+
+	// Update database version to 23
+	if(!db_set_FTL_property(db, DB_VERSION, 23))
+	{
+		log_err("add_query_storage_indexes(): Failed to update database version!");
+		dbquery(db, "ROLLBACK");
+		return false;
+	}
+
+	// Finish transaction
+	SQL_bool(db, "END");
+
+	return true;
+}
+
 bool optimize_queries_table(sqlite3 *db)
 {
 	// Start transaction of database update
