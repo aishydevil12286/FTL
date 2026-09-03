@@ -398,7 +398,7 @@ char * __attribute__((malloc)) create_password(const char *password)
 // Shared state for password_attempts_rate_limited()/password_attempts_release()
 // below. File-scope (not function-local) so a successful login can undo its
 // own accounting after the fact -- see password_attempts_release().
-static pthread_mutex_t rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t login_rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct {
 	char addr[48];
 	time_t second;
@@ -408,7 +408,7 @@ static time_t rate_limit_global_second = 0;
 static unsigned int rate_limit_global_count = 0;
 
 // Cheap, stable bucket index from an address string
-static unsigned int password_rate_limit_bucket(const char *addr)
+static unsigned int __attribute__((pure)) password_rate_limit_bucket(const char *addr)
 {
 	unsigned int hash = 5381;
 	for(const unsigned char *p = (const unsigned char *)addr; *p != '\0'; p++)
@@ -425,7 +425,7 @@ static bool password_attempts_rate_limited(const char *remote_addr)
 	                   ? remote_addr : "unknown";
 	const unsigned int idx = password_rate_limit_bucket(addr);
 
-	pthread_mutex_lock(&rate_limit_lock);
+	pthread_mutex_lock(&login_rate_limit_lock);
 
 	if(rate_limit_global_second != now)
 	{
@@ -434,7 +434,7 @@ static bool password_attempts_rate_limited(const char *remote_addr)
 	}
 	if(++rate_limit_global_count > MAX_PASSWORD_ATTEMPTS_GLOBAL_PER_SECOND)
 	{
-		pthread_mutex_unlock(&rate_limit_lock);
+		pthread_mutex_unlock(&login_rate_limit_lock);
 		sleepms(250);
 		return true;
 	}
@@ -450,12 +450,12 @@ static bool password_attempts_rate_limited(const char *remote_addr)
 
 	if(++rate_limit_buckets[idx].count > MAX_PASSWORD_ATTEMPTS_PER_SECOND)
 	{
-		pthread_mutex_unlock(&rate_limit_lock);
+		pthread_mutex_unlock(&login_rate_limit_lock);
 		sleepms(250);
 		return true;
 	}
 
-	pthread_mutex_unlock(&rate_limit_lock);
+	pthread_mutex_unlock(&login_rate_limit_lock);
 	return false;
 }
 
@@ -474,13 +474,13 @@ static void password_attempts_release(const char *remote_addr)
 	                   ? remote_addr : "unknown";
 	const unsigned int idx = password_rate_limit_bucket(addr);
 
-	pthread_mutex_lock(&rate_limit_lock);
+	pthread_mutex_lock(&login_rate_limit_lock);
 	if(rate_limit_global_count > 0)
 		rate_limit_global_count--;
 	if(strncmp(rate_limit_buckets[idx].addr, addr, sizeof(rate_limit_buckets[idx].addr)) == 0 &&
 	   rate_limit_buckets[idx].count > 0)
 		rate_limit_buckets[idx].count--;
-	pthread_mutex_unlock(&rate_limit_lock);
+	pthread_mutex_unlock(&login_rate_limit_lock);
 }
 
 enum password_result verify_login(const char *password, const char *remote_addr)
