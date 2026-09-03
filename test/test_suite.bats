@@ -603,7 +603,7 @@ setup() {
   assert_line --partial "CREATE TABLE IF NOT EXISTS \"network\" (id INTEGER PRIMARY KEY NOT NULL, hwaddr TEXT UNIQUE NOT NULL, interface TEXT NOT NULL, firstSeen INTEGER NOT NULL, lastQuery INTEGER NOT NULL, numQueries INTEGER NOT NULL, macVendor TEXT, aliasclient_id INTEGER);"
   assert_line --partial "CREATE TABLE IF NOT EXISTS \"network_addresses\" (network_id INTEGER NOT NULL, ip TEXT UNIQUE NOT NULL, lastSeen INTEGER NOT NULL DEFAULT (cast(strftime('%s', 'now') as int)), name TEXT, nameUpdated INTEGER, FOREIGN KEY(network_id) REFERENCES network(id));"
   assert_line --partial "CREATE TABLE aliasclient (id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL, comment TEXT);"
-  assert_line --partial "INSERT INTO ftl VALUES(0,22,'Database version');"
+  assert_line --partial "INSERT INTO ftl VALUES(0,23,'Database version');"
   # vvv This has been added in version 10 vvv
   assert_line --partial "CREATE VIEW queries AS SELECT q.id, q.timestamp, q.type, q.status, COALESCE(d.domain, q.domain) AS domain, COALESCE(c.ip, q.client) AS client, COALESCE(f.forward, q.forward) AS forward, COALESCE(a.content, q.additional_info) AS additional_info, q.reply_type, q.reply_time, q.dnssec, q.list_id, q.ede FROM query_storage q LEFT JOIN domain_by_id d ON q.domain = d.id LEFT JOIN client_by_id c ON q.client = c.id LEFT JOIN forward_by_id f ON q.forward = f.id LEFT JOIN addinfo_by_id a ON q.additional_info = a.id;"
   assert_line --partial "CREATE TABLE domain_by_id (id INTEGER PRIMARY KEY, domain TEXT NOT NULL);"
@@ -618,6 +618,13 @@ setup() {
   assert_line --partial "CREATE TABLE session (id INTEGER PRIMARY KEY, login_at TIMESTAMP NOT NULL, valid_until TIMESTAMP NOT NULL, remote_addr TEXT NOT NULL, user_agent TEXT, sid TEXT NOT NULL, csrf TEXT NOT NULL, tls_login BOOL, tls_mixed BOOL, app BOOL, cli BOOL, x_forwarded_for TEXT);"
   # vvv This has been added in version 20 vvv
   assert_line --partial "CREATE INDEX network_addresses_network_id_index ON network_addresses (network_id);"
+  # vvv This has been added in version 23 vvv
+  assert_line --partial "CREATE INDEX idx_query_storage_type ON query_storage (type);"
+  assert_line --partial "CREATE INDEX idx_query_storage_status ON query_storage (status);"
+  assert_line --partial "CREATE INDEX idx_query_storage_domain ON query_storage (domain);"
+  assert_line --partial "CREATE INDEX idx_query_storage_client ON query_storage (client);"
+  assert_line --partial "CREATE INDEX idx_query_storage_reply_type ON query_storage (reply_type);"
+  assert_line --partial "CREATE INDEX idx_query_storage_dnssec ON query_storage (dnssec);"
 }
 
 @test "Ownership, permissions and type of pihole-FTL.db correct" {

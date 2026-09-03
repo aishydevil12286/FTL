@@ -747,6 +747,25 @@ void db_init(void)
 		dbversion = db_get_int(db, DB_VERSION);
 	}
 
+	// Update to version 23 if lower
+	if(dbversion < 23)
+	{
+		// Update to version 23: Add indexes on query_storage matching
+		// the ones already present on the in-memory database, so
+		// filtered Query Log lookups reaching into on-disk history
+		// don't fall back to a full table scan
+		log_info("Updating long-term database to version 23");
+		if(!add_query_storage_indexes(db))
+		{
+			log_info("Query storage indexes cannot be added, database not available");
+			dbclose(&db);
+			DBerror = true;
+			return;
+		}
+		// Get updated version
+		dbversion = db_get_int(db, DB_VERSION);
+	}
+
 	/* * * * * * * * * * * * * IMPORTANT * * * * * * * * * * * * *
 	 * If you add a new database version, check if the in-memory
 	 * schema needs to be update as well (always recreated from
