@@ -17,7 +17,7 @@
 void sha256_raw_to_hex(uint8_t *data, char *buffer);
 char *create_password(const char *password) __attribute__((malloc));
 bool get_secure_randomness(uint8_t *buffer, const size_t length);
-enum password_result verify_login(const char *password);
+enum password_result verify_login(const char *password, const char *remote_addr);
 enum password_result verify_password(const char *password, const char *pwhash, const bool rate_limiting);
 int run_performance_test(void);
 bool set_and_check_password(struct conf_item *conf_item, const char *password);
@@ -34,7 +34,11 @@ enum password_result {
 	PASSWORD_RATE_LIMITED = -1
 } __attribute__((packed));
 
-// The maximum number of password attempts per second
+// The maximum number of password attempts per second (per client address)
 #define MAX_PASSWORD_ATTEMPTS_PER_SECOND 3
+// Soft global ceiling across all clients to blunt distributed brute-force
+#define MAX_PASSWORD_ATTEMPTS_GLOBAL_PER_SECOND 30
+// Number of per-IP rate-limit buckets (power of two for cheap masking)
+#define PASSWORD_RATE_LIMIT_BUCKETS 64
 
 #endif //PASSWORD_H

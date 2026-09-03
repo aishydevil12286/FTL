@@ -24,8 +24,11 @@
 #include "database/common.h"
 // get_db_info()
 #include "database/query-table.h"
-// getgrgid()
+// getgrgid_r() / getpwuid_r() — thread-safe (musl getpwuid/getgrgid use
+// process-wide static buffers and corrupt the heap under concurrent
+// civetweb-worker calls; see pi-hole/FTL#3029)
 #include <grp.h>
+#include <pwd.h>
 // config struct
 #include "config/config.h"
 // struct clientsData
@@ -115,31 +118,43 @@ int api_info_database(struct ftl_conn *api)
 	JSON_ADD_NUMBER_TO_OBJECT(json, "mtime", st.st_mtime); // Time of last modification
 	JSON_ADD_NUMBER_TO_OBJECT(json, "ctime", st.st_ctime); // Time of last status change (owner or mode change, etc.)
 
-	// Get owner details
+	// Get owner details using reentrant lookups. Concurrent civetweb workers
+	// calling the non-_r variants on musl share file-scope static buffers and
+	// corrupt the heap (FTL#3029).
 	cJSON *user = JSON_NEW_OBJECT();
 	JSON_ADD_NUMBER_TO_OBJECT(user, "uid", st.st_uid); // UID
-	const struct passwd *pw = getpwuid(st.st_uid);
-	if(pw != NULL)
 	{
-		JSON_COPY_STR_TO_OBJECT(user, "name", pw->pw_name); // User name
-		JSON_COPY_STR_TO_OBJECT(user, "info", pw->pw_gecos); // User information
-	}
-	else
-	{
-		JSON_ADD_NULL_TO_OBJECT(user, "name");
-		JSON_ADD_NULL_TO_OBJECT(user, "info");
+		struct passwd pwd;
+		struct passwd *pw = NULL;
+		char pwbuf[4096];
+		const int pwerr = getpwuid_r(st.st_uid, &pwd, pwbuf, sizeof(pwbuf), &pw);
+		if(pwerr == 0 && pw != NULL)
+		{
+			JSON_COPY_STR_TO_OBJECT(user, "name", pw->pw_name); // User name
+			JSON_COPY_STR_TO_OBJECT(user, "info", pw->pw_gecos); // User information
+		}
+		else
+		{
+			JSON_ADD_NULL_TO_OBJECT(user, "name");
+			JSON_ADD_NULL_TO_OBJECT(user, "info");
+		}
 	}
 
 	cJSON *group = JSON_NEW_OBJECT();
 	JSON_ADD_NUMBER_TO_OBJECT(group, "gid", st.st_gid); // GID
-	const struct group *gr = getgrgid(st.st_gid);
-	if(gr != NULL)
 	{
-		JSON_COPY_STR_TO_OBJECT(group, "name", gr->gr_name); // Group name
-	}
-	else
-	{
-		JSON_ADD_NULL_TO_OBJECT(group, "name");
+		struct group grp;
+		struct group *gr = NULL;
+		char grbuf[4096];
+		const int grerr = getgrgid_r(st.st_gid, &grp, grbuf, sizeof(grbuf), &gr);
+		if(grerr == 0 && gr != NULL)
+		{
+			JSON_COPY_STR_TO_OBJECT(group, "name", gr->gr_name); // Group name
+		}
+		else
+		{
+			JSON_ADD_NULL_TO_OBJECT(group, "name");
+		}
 	}
 	cJSON *owner = JSON_NEW_OBJECT();
 	JSON_ADD_ITEM_TO_OBJECT(owner, "user", user);

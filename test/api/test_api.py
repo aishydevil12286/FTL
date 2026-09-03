@@ -469,6 +469,21 @@ class TestURIControlCharRejection:
         assert b" 400 " not in status_line, \
             f"Legitimate .lp request was rejected: {status_line!r}"
 
+    def test_encoded_crlf_in_query_string_not_split_into_headers(self, api_session):
+        # Without decode_query_string, %0d%0a stays literal in the query and
+        # must not become a real header boundary when reflected into Location.
+        # (decode_query_string is also denied via advancedOpts.)
+        req = (
+            b"GET /admin/index.lp?x=%0d%0aSet-Cookie:%20injected=1 HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+        )
+        resp = _raw_http(req)
+        headers = resp.split(b"\r\n\r\n", 1)[0].lower()
+        assert b"set-cookie: injected" not in headers, \
+            f"Encoded CRLF from query string reflected into headers:\n{resp!r}"
+
 
 # ---------------------------------------------------------------------------
 # DNS blocking status

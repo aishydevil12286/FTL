@@ -458,6 +458,29 @@ static int api_list_write(struct ftl_conn *api,
 				                       it->valuestring);
 			}
 
+			// Adlist addresses must use an allowlisted URL scheme. Without
+			// this, javascript:/data: values can be stored and later rendered
+			// as hrefs in the web UI.
+			if(listtype == GRAVITY_ADLISTS ||
+			   listtype == GRAVITY_ADLISTS_BLOCK ||
+			   listtype == GRAVITY_ADLISTS_ALLOW)
+			{
+				const char *addr = it->valuestring;
+				const bool ok_scheme =
+					strncasecmp(addr, "http://", 7) == 0 ||
+					strncasecmp(addr, "https://", 8) == 0 ||
+					strncasecmp(addr, "file://", 7) == 0;
+				if(!ok_scheme)
+				{
+					if(allocated_json)
+						cJSON_Delete(row.items);
+					return send_json_error(api, 400,
+					                       "bad_request",
+					                       "List addresses must start with http://, https://, or file://",
+					                       addr);
+				}
+			}
+
 			if(listtype == GRAVITY_DOMAINLIST_ALLOW_EXACT ||
 			   listtype == GRAVITY_DOMAINLIST_DENY_EXACT)
 			{

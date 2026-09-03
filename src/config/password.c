@@ -99,6 +99,8 @@ static char * __attribute__((malloc)) double_sha256_password(const char *passwor
 	return strdup(response);
 }
 
+// Thread-safe: getrandom() is a syscall and the /dev/urandom fallback opens
+// its own stream per call, so this keeps no state shared between callers
 bool get_secure_randomness(uint8_t *buffer, const size_t length)
 {
 	ssize_t result = -1;
@@ -112,8 +114,6 @@ bool get_secure_randomness(uint8_t *buffer, const size_t length)
 	if (result < 0 && errno == EAGAIN)
 	{
 		log_warn("Not enough entropy available right now for generating secure randomness, retrying in blocking mode");
-		// Sleep for 1 second to give the kernel some time to gather entropy
-		sleepms(1000);
 	}
 	else
 	{
@@ -395,26 +395,123 @@ char * __attribute__((malloc)) create_password(const char *password)
 	return balloon_password(password, salt, true);
 }
 
-enum password_result verify_login(const char *password)
+// Shared state for password_attempts_rate_limited()/password_attempts_release()
+// below. File-scope (not function-local) so a successful login can undo its
+// own accounting after the fact -- see password_attempts_release().
+static pthread_mutex_t rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	char addr[48];
+	time_t second;
+	unsigned int count;
+} rate_limit_buckets[PASSWORD_RATE_LIMIT_BUCKETS];
+static time_t rate_limit_global_second = 0;
+static unsigned int rate_limit_global_count = 0;
+
+// Cheap, stable bucket index from an address string
+static unsigned int password_rate_limit_bucket(const char *addr)
+{
+	unsigned int hash = 5381;
+	for(const unsigned char *p = (const unsigned char *)addr; *p != '\0'; p++)
+		hash = ((hash << 5) + hash) + *p;
+	return hash & (PASSWORD_RATE_LIMIT_BUCKETS - 1);
+}
+
+// Per-IP + soft global rate limit for login attempts. Returns true when the
+// caller should reject with PASSWORD_RATE_LIMITED.
+static bool password_attempts_rate_limited(const char *remote_addr)
+{
+	const time_t now = time(NULL);
+	const char *addr = (remote_addr != NULL && remote_addr[0] != '\0')
+	                   ? remote_addr : "unknown";
+	const unsigned int idx = password_rate_limit_bucket(addr);
+
+	pthread_mutex_lock(&rate_limit_lock);
+
+	if(rate_limit_global_second != now)
+	{
+		rate_limit_global_second = now;
+		rate_limit_global_count = 0;
+	}
+	if(++rate_limit_global_count > MAX_PASSWORD_ATTEMPTS_GLOBAL_PER_SECOND)
+	{
+		pthread_mutex_unlock(&rate_limit_lock);
+		sleepms(250);
+		return true;
+	}
+
+	if(strncmp(rate_limit_buckets[idx].addr, addr, sizeof(rate_limit_buckets[idx].addr)) != 0 ||
+	   rate_limit_buckets[idx].second != now)
+	{
+		strncpy(rate_limit_buckets[idx].addr, addr, sizeof(rate_limit_buckets[idx].addr) - 1);
+		rate_limit_buckets[idx].addr[sizeof(rate_limit_buckets[idx].addr) - 1] = '\0';
+		rate_limit_buckets[idx].second = now;
+		rate_limit_buckets[idx].count = 0;
+	}
+
+	if(++rate_limit_buckets[idx].count > MAX_PASSWORD_ATTEMPTS_PER_SECOND)
+	{
+		pthread_mutex_unlock(&rate_limit_lock);
+		sleepms(250);
+		return true;
+	}
+
+	pthread_mutex_unlock(&rate_limit_lock);
+	return false;
+}
+
+// Undo the accounting password_attempts_rate_limited() did for an attempt
+// that turned out to have the correct password, so successful logins do not
+// count against the rate limit -- only repeated wrong attempts should. This
+// mirrors the "Successful logins do not count against rate-limiting"
+// exemption the counter this replaced had. Without it, any burst of prior
+// attempts from the same client within the same second -- even legitimate
+// ones, e.g. a password manager retry or the auth stress test -- can push a
+// later, correct login attempt from that client over the limit and reject it
+// with 429 for no good reason.
+static void password_attempts_release(const char *remote_addr)
+{
+	const char *addr = (remote_addr != NULL && remote_addr[0] != '\0')
+	                   ? remote_addr : "unknown";
+	const unsigned int idx = password_rate_limit_bucket(addr);
+
+	pthread_mutex_lock(&rate_limit_lock);
+	if(rate_limit_global_count > 0)
+		rate_limit_global_count--;
+	if(strncmp(rate_limit_buckets[idx].addr, addr, sizeof(rate_limit_buckets[idx].addr)) == 0 &&
+	   rate_limit_buckets[idx].count > 0)
+		rate_limit_buckets[idx].count--;
+	pthread_mutex_unlock(&rate_limit_lock);
+}
+
+enum password_result verify_login(const char *password, const char *remote_addr)
 {
 	// Check if this is the CLI password
 	if(config.webserver.api.cli_pw.v.b && cli_password != NULL)
 	{
-		if(strcmp(cli_password, password) == 0)
+		if(password != NULL && strcmp(cli_password, password) == 0)
 			return CLIPASSWORD_CORRECT;
 	}
 
-	enum password_result pw = verify_password(password, config.webserver.api.pwhash.v.s, true);
+	if(password_attempts_rate_limited(remote_addr))
+		return PASSWORD_RATE_LIMITED;
+
+	// Rate limiting is applied once above so the main + app password checks
+	// below do not double-count a single login attempt.
+	enum password_result pw = verify_password(password, config.webserver.api.pwhash.v.s, false);
 	log_debug(DEBUG_API, "Password %s correct", pw == PASSWORD_CORRECT ? "" : "not");
 
 	// Check if an application password is set and if it matches
 	if(pw == PASSWORD_INCORRECT &&
 	   strlen(config.webserver.api.app_pwhash.v.s) > 0 &&
-	   verify_password(password, config.webserver.api.app_pwhash.v.s, true) == PASSWORD_CORRECT)
+	   verify_password(password, config.webserver.api.app_pwhash.v.s, false) == PASSWORD_CORRECT)
 	{
 		log_debug(DEBUG_API, "App password correct");
-		return APPPASSWORD_CORRECT;
+		pw = APPPASSWORD_CORRECT;
 	}
+
+	// A correct password should not count against the rate limit
+	if(pw == PASSWORD_CORRECT || pw == APPPASSWORD_CORRECT)
+		password_attempts_release(remote_addr);
 
 	// Return result
 	return pw;

@@ -62,7 +62,19 @@ int api_padd(struct ftl_conn *api)
 				if(domain == NULL)
 					continue;
 
-				JSON_COPY_STR_TO_OBJECT(json, "recent_blocked", domain);
+				// The JSON_* macros cannot be used while we hold
+				// the lock, as their early return would leave it
+				// taken for good
+				cJSON *item = cJSON_CreateString(domain);
+				if(item == NULL)
+				{
+					log_err("api_padd(): Failed to allocate JSON string");
+					cJSON_Delete(json);
+					unlock_shm();
+					send_http_internal_error(api);
+					return 500;
+				}
+				cJSON_AddItemToObject(json, "recent_blocked", item);
 				break;
 			}
 		}
@@ -198,7 +210,10 @@ int api_padd(struct ftl_conn *api)
 		unsigned int v4_addrs = 0, v6_addrs = 0;
 		cJSON_ArrayForEach(entry, interfaces)
 		{
-			if(strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(entry, "name")), gw_v4_name) == 0)
+			// gw_v4_name is NULL when no default IPv4 route was found above;
+			// skip the comparison rather than pass NULL to strcmp() (UB/crash).
+			if(gw_v4_name != NULL &&
+			   strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(entry, "name")), gw_v4_name) == 0)
 			{
 				// Add first interface address with family == inet
 				cJSON *addr = NULL;
@@ -228,7 +243,10 @@ int api_padd(struct ftl_conn *api)
 				cJSON *tx_bytes = cJSON_GetObjectItemCaseSensitive(stats, "tx_bytes");
 				JSON_ADD_ITEM_TO_OBJECT(iface_v4, "tx_bytes", cJSON_Duplicate(tx_bytes, true));
 			}
-			if(strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(entry, "name")), gw_v6_name) == 0)
+			// gw_v6_name is NULL when no default IPv4 or IPv6 route was found
+			// above; skip the comparison rather than pass NULL to strcmp().
+			if(gw_v6_name != NULL &&
+			   strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(entry, "name")), gw_v6_name) == 0)
 			{
 				// Add first interface address with family == inet
 				cJSON *addr = NULL;
